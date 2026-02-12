@@ -6,6 +6,7 @@
 #include "freertos/task.h"
 #include <string.h>
 #include "esp_log.h"
+#include "epaper_utils.h"
 
 // GPIO pin definitions - adjust these according to your wiring
 #define PIN_NUM_MOSI    18          // Violet
@@ -54,8 +55,8 @@ void epaper_send_data(uint8_t data) {
 
 void epaper_clearDisplay(void)
 {
-    epaper_sendColor(0x10, 0x00, (uint32_t)BUFFER_SIZE);
-    epaper_sendColor(0x13, 0x00, (uint32_t)BUFFER_SIZE);
+    epaper_send_color(0x10, 0x00, (uint32_t)BUFFER_SIZE);
+    epaper_send_color(0x13, 0x00, (uint32_t)BUFFER_SIZE);
     epaper_flushDisplay();
 }
 
@@ -79,13 +80,13 @@ void epaper_DCDC_powerOff(void)
   epaper_waitBusy();
 }
 
-void epaper_sendColor(uint8_t index, const uint8_t data, uint32_t len)
+void epaper_send_color(uint8_t index, const uint8_t data, uint32_t len)
 {
     epaper_send_command(index);
     gpio_set_level(PIN_NUM_DC, 1); // Data mode
     gpio_set_level(PIN_NUM_CS, 0); // Select
     // Send the same byte 'data' for 'len' times
-    for (uint32_t i = 0; i < len; i++) {
+    for (uint32_t i = 0; i < len / 8; i++) {
         spi_transaction_t t = {
             .length = 8, // 1 byte = 8 bits
             .tx_buffer = &data,
@@ -101,14 +102,8 @@ void epaper_sendColor(uint8_t index, const uint8_t data, uint32_t len)
 
 void epaper_fill(uint8_t color)
 {
-    uint8_t bw = 0x00, red = 0x00;
-    if (color == COLOR_WHITE) { // COLOR_WHITE
-        bw = 0x00; red = 0x00;
-    } else if (color == COLOR_BLACK) { // COLOR_BLACK
-        bw = 0x00; red = 0xFF;
-    } else if (color == COLOR_RED) { // COLOR_RED
-        bw = 0xFF; red = 0xFF;
-    }
+    uint8_t bw = epaper_color_bw(color), red = epaper_color_red(color);
+
     // Fill BW channel (0x13) FIRST
     epaper_send_command(0x13);
     for (uint32_t i = 0; i < BUFFER_SIZE; i++) {
@@ -196,8 +191,6 @@ void epaper_waitBusy(void)
     int timeout = 5000; // 5000 x 2ms = 10s max wait
     // NOTE: Some displays use BUSY=1 when busy, others BUSY=0. Adjust logic if needed!
     do {
-        int busy_level = gpio_get_level(PIN_NUM_BUSY);
-        ESP_LOGI("epaper", "BUSY pin state: %d", busy_level);
         vTaskDelay(pdMS_TO_TICKS(2));
         timeout--;
         if (timeout <= 0) {
@@ -212,6 +205,22 @@ void epaper_softReset(void)
 {
   epaper_sendIndexData(0x00, &register_data[1], 1);
   epaper_waitBusy();
+}
+
+void epaper_set_partial_window(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  static __xdata uint8_t params[9];
+  // Coordinates for UC81xx (x must be multiple of 8)
+  params[0] = x >> 8;
+  params[1] = x & 0xF8;
+  params[2] = (x + w - 1) >> 8;
+  params[3] = (x + w - 1) | 0x07;
+  params[4] = y >> 8;
+  params[5] = y & 0xFF;
+  params[6] = (y + h - 1) >> 8;
+  params[7] = (y + h - 1) & 0xFF;
+  params[8] = 0x00; // PT_SCAN: 0: Scan inside window, 1: Scan outside?
+
+  epaper_sendIndexData(0x90, params, 9);
 }
 
 void epaper_sendIndexData(uint8_t index, const uint8_t *data, uint32_t len)
@@ -263,4 +272,40 @@ void epaper_send_buffer(const uint8_t *buffer, size_t length) {
         }
         offset += chunk;
     }
+}
+
+void epaper_line(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint8_t color) {
+    epaper_DCDC_powerOn();
+
+    uint8_t bw = epaper_color_bw(color), red = epaper_color_red(color);
+    epaper_send_color(0x10, bw, BUFFER_SIZE);
+    epaper_send_color(0x13, red, BUFFER_SIZE);
+
+    epaper_send_command(0x12);
+
+    epaper_waitBusy();
+    epaper_DCDC_powerOff();
+}
+
+
+void epaper_rect(
+    uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t color
+) {
+    epaper_DCDC_powerOn();
+    epaper_send_command(0x91); // Partial In
+    epaper_set_partial_window(x, y, w, h);
+  
+    uint32_t len = (uint32_t)(w / 8) * h;
+  
+    uint8_t bw = epaper_color_bw(color), red = epaper_color_red(color);
+    epaper_send_color(0x10, bw, len);
+    epaper_send_color(0x13, red, len);
+  
+    // Usamos el comando 0x12 solo, sin parámetros extras
+    epaper_send_command(0x12);
+    epaper_waitBusy();
+  
+    epaper_send_command(0x92); // Partial Out
+    epaper_DCDC_powerOff();
+
 }
