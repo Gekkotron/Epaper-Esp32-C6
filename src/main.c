@@ -9,6 +9,7 @@
 // WS2812 RGB LED driver
 #include "ws2812.h"
 #include "driver/ledc.h"
+#include "wifi/wifi.h"
 
 static const char *TAG = "main";
 
@@ -101,6 +102,15 @@ return;*/
     vTaskDelay(pdMS_TO_TICKS(500));
     ws2812_set_color(0, 0, 255);
     vTaskDelay(pdMS_TO_TICKS(500));*/
+wifi_mgr_init();
+wifi_mgr_connect("Pixel_3683", "sk2gdgprw4w4mf4");
+wifi_mgr_wait_for_connection(10000); // Wait up to 10 seconds
+
+if (wifi_mgr_is_connected()) {
+    char ip[16];
+    wifi_mgr_get_ip_address(ip);
+    ESP_LOGI(TAG, "Connected with IP: %s", ip);
+}*/
 
     ESP_LOGI(TAG, "Starting E-Paper Display Example");
 
