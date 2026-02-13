@@ -35,7 +35,7 @@ void epaper_spi_init(void) {
         .max_transfer_sz = 4096,
     };
     spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 200 * 1000,
+        .clock_speed_hz = 4 * 1000 * 1000,
         .mode = 0,
         .spics_io_num = PIN_NUM_CS,
         .queue_size = 1,
@@ -208,19 +208,22 @@ void epaper_softReset(void)
 }
 
 void epaper_set_partial_window(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
-  static __xdata uint8_t params[9];
-  // Coordinates for UC81xx (x must be multiple of 8)
-  params[0] = x >> 8;
-  params[1] = x & 0xF8;
-  params[2] = (x + w - 1) >> 8;
-  params[3] = (x + w - 1) | 0x07;
-  params[4] = y >> 8;
-  params[5] = y & 0xFF;
-  params[6] = (y + h - 1) >> 8;
-  params[7] = (y + h - 1) & 0xFF;
-  params[8] = 0x00; // PT_SCAN: 0: Scan inside window, 1: Scan outside?
+  // Align coordinates to byte boundaries (multiples of 8)
+  uint16_t xe = (x + w - 1) | 0x0007; // byte boundary inclusive (last byte)
+  uint16_t ye = y + h - 1;
+  x &= 0xFFF8; // byte boundary
 
-  epaper_sendIndexData(0x90, params, 9);
+  // Send partial window command with correct byte order (GxEPD2 format)
+  uint8_t params[7];
+  params[0] = x % 256;        // x LSB
+  params[1] = xe % 256;       // xe LSB
+  params[2] = y / 256;        // y MSB
+  params[3] = y % 256;        // y LSB
+  params[4] = ye / 256;       // ye MSB
+  params[5] = ye % 256;       // ye LSB
+  params[6] = 0x01;           // Control byte
+
+  epaper_sendIndexData(0x90, params, 7);
 }
 
 void epaper_sendIndexData(uint8_t index, const uint8_t *data, uint32_t len)
@@ -271,6 +274,11 @@ void epaper_send_buffer(const uint8_t *buffer, size_t length) {
             break;
         }
         offset += chunk;
+
+        // Yield to watchdog every 8KB to prevent timeout
+        if (offset % 8192 == 0) {
+            vTaskDelay(1);
+        }
     }
 }
 
@@ -288,24 +296,662 @@ void epaper_line(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint8_t col
 }
 
 
-void epaper_rect(
-    uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t color
-) {
+// Static framebuffers for display content
+static uint8_t *framebuffer_bw = NULL;
+static uint8_t *framebuffer_red = NULL;
+
+// Global screen orientation (default: 0°)
+static uint8_t screen_orientation = ORIENTATION_0;
+
+// Forward declaration for coordinate transformation
+static inline void transform_coordinates(uint16_t x, uint16_t y, uint8_t orientation, uint16_t *out_x, uint16_t *out_y);
+
+// Initialize framebuffers (call once)
+static void epaper_framebuffer_init(void) {
+    if (framebuffer_bw == NULL) {
+        framebuffer_bw = (uint8_t*)malloc(BUFFER_SIZE);
+        if (framebuffer_bw == NULL) {
+            ESP_LOGE("epaper", "Failed to allocate BW framebuffer");
+            return;
+        }
+        memset(framebuffer_bw, 0x00, BUFFER_SIZE);
+        ESP_LOGI("epaper", "Allocated BW framebuffer: %d bytes", BUFFER_SIZE);
+    }
+
+    if (framebuffer_red == NULL) {
+        framebuffer_red = (uint8_t*)malloc(BUFFER_SIZE);
+        if (framebuffer_red == NULL) {
+            ESP_LOGE("epaper", "Failed to allocate RED framebuffer");
+            return;
+        }
+        memset(framebuffer_red, 0x00, BUFFER_SIZE);
+        ESP_LOGI("epaper", "Allocated RED framebuffer: %d bytes", BUFFER_SIZE);
+    }
+}
+
+// Helper function: draw a single pixel directly without orientation (for internal use)
+static inline void epaper_draw_pixel_direct(uint16_t x, uint16_t y, uint8_t color) {
+    // Check bounds
+    if (x >= SCREEN_2_6_WIDTH || y >= SCREEN_2_6_HEIGHT) {
+        return;
+    }
+
+    // Calculate framebuffer position
+    uint16_t byte_idx = y * BYTES_PER_ROW + (x / 8);
+    uint8_t bit_mask = 0x80 >> (x % 8);
+
+    uint8_t bw = epaper_color_bw(color);
+    uint8_t red = epaper_color_red(color);
+
+    if (bw) {
+        framebuffer_bw[byte_idx] |= bit_mask;
+    } else {
+        framebuffer_bw[byte_idx] &= ~bit_mask;
+    }
+
+    if (red) {
+        framebuffer_red[byte_idx] |= bit_mask;
+    } else {
+        framebuffer_red[byte_idx] &= ~bit_mask;
+    }
+}
+
+// Helper function: draw a single pixel with orientation support
+static inline void epaper_draw_pixel(uint16_t x, uint16_t y, uint8_t color) {
+    // Apply orientation transformation
+    uint16_t out_x, out_y;
+    transform_coordinates(x, y, screen_orientation, &out_x, &out_y);
+    epaper_draw_pixel_direct(out_x, out_y, color);
+}
+
+// Draw rectangle (uses global orientation)
+void epaper_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t color) {
+    epaper_framebuffer_init();
+
+    for (uint16_t row = 0; row < h; row++) {
+        for (uint16_t col = 0; col < w; col++) {
+            epaper_draw_pixel(x + col, y + row, color);
+        }
+    }
+}
+
+void test_rect() {
+    epaper_display_clear();
+    
+    // Rectangle aligné sur byte boundary (plus facile à débugger)
+    epaper_rect(0, 0, 32, 32, COLOR_BLACK);   // coin haut-gauche
+    epaper_rect(40, 0, 32, 32, COLOR_RED);    // à côté
+    
+    // Debug
+    ESP_LOGI("epaper", "Byte 0: 0x%02X (should be 0xFF if black)", framebuffer_bw[0]);
+    ESP_LOGI("epaper", "Byte 19: 0x%02X (row 1, should be 0xFF)", framebuffer_bw[BYTES_PER_ROW]);
+    
+    epaper_display_update();
+}
+
+// Send framebuffer to display and refresh (call after drawing operations)
+void epaper_display_update(void) {
+    if (framebuffer_bw == NULL || framebuffer_red == NULL) {
+        ESP_LOGE("epaper", "Framebuffers not initialized");
+        return;
+    }
+
+    ESP_LOGI("epaper", "Updating display from framebuffer...");
+
+    // Debug: print first few bytes to verify data
+    ESP_LOGI("epaper", "BW buffer first 8 bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
+             framebuffer_bw[0], framebuffer_bw[1], framebuffer_bw[2], framebuffer_bw[3],
+             framebuffer_bw[4], framebuffer_bw[5], framebuffer_bw[6], framebuffer_bw[7]);
+    ESP_LOGI("epaper", "RED buffer first 8 bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
+             framebuffer_red[0], framebuffer_red[1], framebuffer_red[2], framebuffer_red[3],
+             framebuffer_red[4], framebuffer_red[5], framebuffer_red[6], framebuffer_red[7]);
+
+    // Match epaper_fill() pattern which works
+    // Fill BW channel (0x13) FIRST
+    epaper_send_command(0x13);
+    for (uint32_t i = 0; i < BUFFER_SIZE; i++) {
+        epaper_send_data(framebuffer_red[i]);
+        // Yield every 1024 bytes to avoid watchdog
+        if ((i % 1024) == 0 && i > 0) {
+            vTaskDelay(1);
+        }
+    }
+
+    // Fill RED channel (0x10) SECOND
+    epaper_send_command(0x10);
+    for (uint32_t i = 0; i < BUFFER_SIZE; i++) {
+        epaper_send_data(framebuffer_bw[i]);
+        // Yield every 1024 bytes to avoid watchdog
+        if ((i % 1024) == 0 && i > 0) {
+            vTaskDelay(1);
+        }
+    }
+
+    // Refresh display - use epaper_flushDisplay() pattern (includes power management)
+    ESP_LOGI("epaper", "Refreshing display...");
+    epaper_flushDisplay();
+    ESP_LOGI("epaper", "Display update complete");
+}
+
+// Clear framebuffer to white
+void epaper_display_clear(void) {
+    epaper_framebuffer_init();
+    memset(framebuffer_bw, 0x00, BUFFER_SIZE);
+    memset(framebuffer_red, 0x00, BUFFER_SIZE);
+    ESP_LOGI("epaper", "Framebuffer cleared");
+}
+
+// Set global screen orientation
+void epaper_set_orientation(uint8_t orientation) {
+    if (orientation <= ORIENTATION_270) {
+        screen_orientation = orientation;
+        ESP_LOGI("epaper", "Screen orientation set to %d°", orientation * 90);
+    } else {
+        ESP_LOGE("epaper", "Invalid orientation: %d", orientation);
+    }
+}
+
+// Get current screen orientation
+uint8_t epaper_get_orientation(void) {
+    return screen_orientation;
+}
+
+// Test if partial updates work on this display
+void epaper_test_partial_update(void) {
+    ESP_LOGI("epaper", "=== Testing Partial Update Support ===");
+
+    // Step 1: Full screen refresh with white
+    ESP_LOGI("epaper", "1. Full refresh - white background");
+    epaper_clearDisplay();
+    vTaskDelay(pdMS_TO_TICKS(20000));
+
+    // Step 2: Draw a black square at (0,0) with PARTIAL mode
+    ESP_LOGI("epaper", "2. Partial update - black square at (0,0)");
     epaper_DCDC_powerOn();
-    epaper_send_command(0x91); // Partial In
-    epaper_set_partial_window(x, y, w, h);
-  
-    uint32_t len = (uint32_t)(w / 8) * h;
-  
-    uint8_t bw = epaper_color_bw(color), red = epaper_color_red(color);
-    epaper_send_color(0x10, bw, len);
-    epaper_send_color(0x13, red, len);
-  
-    // Usamos el comando 0x12 solo, sin parámetros extras
+
+    // Set partial window
+    epaper_set_partial_window(0, 0, 64, 64);
+
+    // Enter partial mode
+    epaper_send_command(0x91);
+
+    // Send just the partial window data (64x64 = 8 bytes wide * 64 rows = 512 bytes)
+    uint32_t partial_size = (64 / 8) * 64;
+
+    // BW channel - send red (0xFF)
+    epaper_send_command(0x13);
+    for (uint32_t i = 0; i < partial_size; i++) {
+        epaper_send_data(0xFF);
+    }
+
+    // RED channel - send black (0x00)
+    epaper_send_command(0x10);
+    for (uint32_t i = 0; i < partial_size; i++) {
+        epaper_send_data(0x00);
+    }
+
+    // Trigger partial refresh
     epaper_send_command(0x12);
     epaper_waitBusy();
-  
-    epaper_send_command(0x92); // Partial Out
+
+    // Exit partial mode
+    epaper_send_command(0x92);
     epaper_DCDC_powerOff();
 
+    ESP_LOGI("epaper", "=== Test Results ===");
+    ESP_LOGI("epaper", "If you see ONLY a black square at top-left:");
+    ESP_LOGI("epaper", "  ✓ Partial updates WORK!");
+    ESP_LOGI("epaper", "If the ENTIRE screen is black or has artifacts:");
+    ESP_LOGI("epaper", "  ✗ Partial updates NOT supported (use full refresh only)");
+    ESP_LOGI("epaper", "=====================");
 }
+
+// Text rendering functions
+#include "font5x7.h"
+#include "font6x12.h"
+#include "font8x16.h"
+
+// Helper function to transform coordinates based on orientation
+static inline void transform_coordinates(uint16_t x, uint16_t y, uint8_t orientation, uint16_t *out_x, uint16_t *out_y) {
+    switch (orientation) {
+        case ORIENTATION_0:   // 0° - Normal
+            *out_x = x;
+            *out_y = y;
+            break;
+        case ORIENTATION_90:  // 90° clockwise
+            *out_x = SCREEN_2_6_HEIGHT - 1 - y;
+            *out_y = x;
+            break;
+        case ORIENTATION_180: // 180°
+            *out_x = SCREEN_2_6_WIDTH - 1 - x;
+            *out_y = SCREEN_2_6_HEIGHT - 1 - y;
+            break;
+        case ORIENTATION_270: // 270° clockwise (90° counter-clockwise)
+            *out_x = y;
+            *out_y = SCREEN_2_6_WIDTH - 1 - x;
+            break;
+        default:
+            *out_x = x;
+            *out_y = y;
+            break;
+    }
+}
+
+// Draw a single character to the framebuffer
+// x, y: top-left corner of character
+// c: character to draw
+// color: COLOR_BLACK, COLOR_RED, or COLOR_WHITE
+// scale: scaling factor (1 = normal, 2 = 2x, etc.)
+void epaper_draw_char(uint16_t x, uint16_t y, char c, uint8_t color, uint8_t scale) {
+    // Check if character is in font range
+    if (c < FONT_FIRST_CHAR || c > FONT_LAST_CHAR) {
+        c = '?'; // Replace unknown chars with question mark
+    }
+
+    // Get font data for this character
+    const uint8_t *glyph = font5x7[c - FONT_FIRST_CHAR];
+
+    // Draw each column of the character
+    for (uint8_t col = 0; col < FONT_WIDTH; col++) {
+        uint8_t column_data = glyph[col];
+
+        // Draw each row (bit) in this column
+        for (uint8_t row = 0; row < FONT_HEIGHT; row++) {
+            if (column_data & (1 << row)) {
+                // Pixel is set - draw it (scaled)
+                for (uint8_t sx = 0; sx < scale; sx++) {
+                    for (uint8_t sy = 0; sy < scale; sy++) {
+                        uint16_t px = x + (col * scale) + sx;
+                        uint16_t py = y + (row * scale) + sy;
+
+                        // Draw single pixel using epaper_rect (1x1 rectangle)
+                        if (px < SCREEN_2_6_WIDTH && py < SCREEN_2_6_HEIGHT) {
+                            epaper_rect(px, py, 1, 1, color);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Draw a text string to the framebuffer (uses global orientation)
+// x, y: top-left corner of first character
+// text: null-terminated string
+// color: COLOR_BLACK, COLOR_RED, or COLOR_WHITE
+// scale: scaling factor (1 = normal, 2 = 2x, etc.)
+void epaper_draw_text(uint16_t x, uint16_t y, const char *text, uint8_t color, uint8_t scale) {
+    if (text == NULL) return;
+
+    uint8_t orientation = screen_orientation;
+    uint16_t char_width = (FONT_WIDTH + 1) * scale;
+
+    // For rotated text, calculate text length and adjust starting position
+    uint16_t cursor_x = x;
+    uint16_t cursor_y = y;
+    if (orientation != ORIENTATION_0) {
+        const char *temp = text;
+        uint16_t char_count = 0;
+        while (*temp) {
+            if ((unsigned char)*temp == 0xC2 || (unsigned char)*temp == 0xC3) {
+                temp += 2;
+                char_count++;
+            } else if (*temp == '\n' || *temp == '\r') {
+                temp++;
+            } else {
+                temp++;
+                char_count++;
+            }
+        }
+        switch (orientation) {
+            case ORIENTATION_90:
+                cursor_y = y + (char_count * char_width);
+                break;
+            case ORIENTATION_180:
+                cursor_x = x + (char_count * char_width);
+                break;
+            case ORIENTATION_270:
+                cursor_y = y + (char_count * char_width);
+                break;
+        }
+    }
+
+    // Calculate character advancement direction
+    int16_t dx = 0, dy = 0;
+    switch (orientation) {
+        case ORIENTATION_0:   dx = char_width; dy = 0; break;
+        case ORIENTATION_90:  dx = 0; dy = char_width; break;
+        case ORIENTATION_180: dx = -char_width; dy = 0; break;
+        case ORIENTATION_270: dx = 0; dy = -char_width; break;
+    }
+
+    while (*text) {
+        uint8_t c;
+        bool is_utf8 = false;
+
+        if ((unsigned char)*text == 0xC2 && (unsigned char)*(text + 1) == 0xB0) {
+            c = 127;
+            is_utf8 = true;
+        } else if ((unsigned char)*text == 0xC3 && (unsigned char)*(text + 1) == 0xA9) {
+            c = 128;
+            is_utf8 = true;
+        } else if ((unsigned char)*text == 0xC3 && (unsigned char)*(text + 1) == 0xA8) {
+            c = 129;
+            is_utf8 = true;
+        } else if (*text == '\n' || *text == '\r') {
+            text++;
+            continue;
+        } else {
+            c = *text;
+        }
+
+        if (c >= FONT_FIRST_CHAR && c <= FONT_LAST_CHAR) {
+            const uint8_t *char_data = font5x7[c - FONT_FIRST_CHAR];
+
+            for (uint8_t col = 0; col < FONT_WIDTH; col++) {
+                uint8_t actual_col = (orientation == ORIENTATION_180) ? (FONT_WIDTH - 1 - col) : col;
+                uint8_t column = char_data[actual_col];
+
+                for (uint8_t row = 0; row < FONT_HEIGHT; row++) {
+                    uint8_t actual_row = (orientation == ORIENTATION_180) ? (FONT_HEIGHT - 1 - row) : row;
+                    if (column & (1 << actual_row)) {
+                        for (uint8_t sy = 0; sy < scale; sy++) {
+                            for (uint8_t sx = 0; sx < scale; sx++) {
+                                uint16_t px = cursor_x + col * scale + sx;
+                                uint16_t py = cursor_y + row * scale + sy;
+                                uint16_t out_x, out_y;
+                                transform_coordinates(px, py, orientation, &out_x, &out_y);
+                                epaper_draw_pixel_direct(out_x, out_y, color);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        cursor_x += dx;
+        cursor_y += dy;
+        text += is_utf8 ? 2 : 1;
+    }
+}
+
+// ========== 6x12 Font Rendering (medium size, good balance) ==========
+
+// Draw a single character using 6x12 font to the framebuffer
+// x, y: top-left corner of character
+// c: character to draw
+// color: COLOR_BLACK, COLOR_RED, or COLOR_WHITE
+// scale: scaling factor (1 = normal, 2 = 2x, etc.)
+void epaper_draw_char_6x12(uint16_t x, uint16_t y, char c, uint8_t color, uint8_t scale) {
+    // Check if character is in font range
+    if (c < FONT6X12_FIRST_CHAR || c > FONT6X12_LAST_CHAR) {
+        c = '?'; // Replace unknown chars with question mark
+    }
+
+    // Get font data for this character
+    const uint8_t *glyph = font6x12[c - FONT6X12_FIRST_CHAR];
+
+    // Draw each row of the character
+    for (uint8_t row = 0; row < FONT6X12_HEIGHT; row++) {
+        uint8_t row_data = glyph[row];
+
+        // Draw each column (bit) in this row
+        for (uint8_t col = 0; col < FONT6X12_WIDTH; col++) {
+            if (row_data & (0x80 >> col)) {
+                // Pixel is set - draw it (scaled)
+                for (uint8_t sx = 0; sx < scale; sx++) {
+                    for (uint8_t sy = 0; sy < scale; sy++) {
+                        uint16_t px = x + (col * scale) + sx;
+                        uint16_t py = y + (row * scale) + sy;
+
+                        // Draw single pixel using epaper_rect (1x1 rectangle)
+                        if (px < SCREEN_2_6_WIDTH && py < SCREEN_2_6_HEIGHT) {
+                            epaper_rect(px, py, 1, 1, color);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Draw a text string using 6x12 font to the framebuffer (uses global orientation)
+// x, y: top-left corner of first character
+// text: null-terminated string
+// color: COLOR_BLACK, COLOR_RED, or COLOR_WHITE
+// scale: scaling factor (1 = normal, 2 = 2x, etc.)
+void epaper_draw_text_6x12(uint16_t x, uint16_t y, const char *text, uint8_t color, uint8_t scale) {
+    if (text == NULL) return;
+
+    uint8_t orientation = screen_orientation;
+    uint16_t char_width = (FONT6X12_WIDTH + 1) * scale;
+
+    // For rotated text, calculate text length and adjust starting position
+    uint16_t cursor_x = x;
+    uint16_t cursor_y = y;
+    if (orientation != ORIENTATION_0) {
+        const char *temp = text;
+        uint16_t char_count = 0;
+        while (*temp) {
+            if ((unsigned char)*temp == 0xC2 || (unsigned char)*temp == 0xC3) {
+                temp += 2;
+                char_count++;
+            } else if (*temp == '\n' || *temp == '\r') {
+                temp++;
+            } else {
+                temp++;
+                char_count++;
+            }
+        }
+        switch (orientation) {
+            case ORIENTATION_90:
+                cursor_y = y + (char_count * char_width);
+                break;
+            case ORIENTATION_180:
+                cursor_x = x + (char_count * char_width);
+                break;
+            case ORIENTATION_270:
+                cursor_y = y + (char_count * char_width);
+                break;
+        }
+    }
+
+    // Calculate character advancement direction
+    int16_t dx = 0, dy = 0;
+    switch (orientation) {
+        case ORIENTATION_0:   dx = char_width; dy = 0; break;
+        case ORIENTATION_90:  dx = 0; dy = char_width; break;
+        case ORIENTATION_180: dx = -char_width; dy = 0; break;
+        case ORIENTATION_270: dx = 0; dy = -char_width; break;
+    }
+
+    while (*text) {
+        uint8_t c;
+        bool is_utf8 = false;
+
+        if ((unsigned char)*text == 0xC2 && (unsigned char)*(text + 1) == 0xB0) {
+            c = 127;
+            is_utf8 = true;
+        } else if ((unsigned char)*text == 0xC3 && (unsigned char)*(text + 1) == 0xA9) {
+            c = 128;
+            is_utf8 = true;
+        } else if ((unsigned char)*text == 0xC3 && (unsigned char)*(text + 1) == 0xA8) {
+            c = 129;
+            is_utf8 = true;
+        } else if (*text == '\n' || *text == '\r') {
+            text++;
+            continue;
+        } else {
+            c = *text;
+        }
+
+        if (c >= FONT6X12_FIRST_CHAR && c <= FONT6X12_LAST_CHAR) {
+            const uint8_t *char_data = font6x12[c - FONT6X12_FIRST_CHAR];
+
+            for (uint8_t row = 0; row < FONT6X12_HEIGHT; row++) {
+                uint8_t actual_row = (orientation == ORIENTATION_180) ? (FONT6X12_HEIGHT - 1 - row) : row;
+                uint8_t line = char_data[actual_row];
+
+                for (uint8_t col = 0; col < FONT6X12_WIDTH; col++) {
+                    uint8_t actual_col = (orientation == ORIENTATION_180) ? (FONT6X12_WIDTH - 1 - col) : col;
+                    if (line & (1 << actual_col)) {
+                        for (uint8_t sy = 0; sy < scale; sy++) {
+                            for (uint8_t sx = 0; sx < scale; sx++) {
+                                uint16_t px = cursor_x + col * scale + sx;
+                                uint16_t py = cursor_y + row * scale + sy;
+                                uint16_t out_x, out_y;
+                                transform_coordinates(px, py, orientation, &out_x, &out_y);
+                                epaper_draw_pixel_direct(out_x, out_y, color);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        cursor_x += dx;
+        cursor_y += dy;
+        text += is_utf8 ? 2 : 1;
+    }
+}
+
+// ========== 8x16 Font Rendering (cleaner, more readable) ==========
+
+// Draw a single character using 8x16 font to the framebuffer
+// x, y: top-left corner of character
+// c: character to draw
+// color: COLOR_BLACK, COLOR_RED, or COLOR_WHITE
+// scale: scaling factor (1 = normal, 2 = 2x, etc.)
+void epaper_draw_char_8x16(uint16_t x, uint16_t y, char c, uint8_t color, uint8_t scale) {
+    // Check if character is in font range
+    if (c < FONT8X16_FIRST_CHAR || c > FONT8X16_LAST_CHAR) {
+        c = '?'; // Replace unknown chars with question mark
+    }
+
+    // Get font data for this character
+    const uint8_t *glyph = font8x16[c - FONT8X16_FIRST_CHAR];
+
+    // Draw each row of the character
+    for (uint8_t row = 0; row < FONT8X16_HEIGHT; row++) {
+        uint8_t row_data = glyph[row];
+
+        // Draw each column (bit) in this row
+        for (uint8_t col = 0; col < FONT8X16_WIDTH; col++) {
+            if (row_data & (0x80 >> col)) {
+                // Pixel is set - draw it (scaled)
+                for (uint8_t sx = 0; sx < scale; sx++) {
+                    for (uint8_t sy = 0; sy < scale; sy++) {
+                        uint16_t px = x + (col * scale) + sx;
+                        uint16_t py = y + (row * scale) + sy;
+
+                        // Draw single pixel using epaper_rect (1x1 rectangle)
+                        if (px < SCREEN_2_6_WIDTH && py < SCREEN_2_6_HEIGHT) {
+                            epaper_rect(px, py, 1, 1, color);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Draw a text string using 8x16 font to the framebuffer (uses global orientation)
+// x, y: top-left corner of first character
+// text: null-terminated string
+// color: COLOR_BLACK, COLOR_RED, or COLOR_WHITE
+// scale: scaling factor (1 = normal, 2 = 2x, etc.)
+void epaper_draw_text_8x16(uint16_t x, uint16_t y, const char *text, uint8_t color, uint8_t scale) {
+    if (text == NULL) return;
+
+    uint8_t orientation = screen_orientation;
+    uint16_t char_width = (FONT8X16_WIDTH + 1) * scale;
+
+    // For rotated text, calculate text length and adjust starting position
+    uint16_t cursor_x = x;
+    uint16_t cursor_y = y;
+    if (orientation != ORIENTATION_0) {
+        const char *temp = text;
+        uint16_t char_count = 0;
+        while (*temp) {
+            if ((unsigned char)*temp == 0xC2 || (unsigned char)*temp == 0xC3) {
+                temp += 2;
+                char_count++;
+            } else if (*temp == '\n' || *temp == '\r') {
+                temp++;
+            } else {
+                temp++;
+                char_count++;
+            }
+        }
+        switch (orientation) {
+            case ORIENTATION_90:
+                cursor_y = y + (char_count * char_width);
+                break;
+            case ORIENTATION_180:
+                cursor_x = x + (char_count * char_width);
+                break;
+            case ORIENTATION_270:
+                cursor_y = y + (char_count * char_width);
+                break;
+        }
+    }
+
+    // Calculate character advancement direction
+    int16_t dx = 0, dy = 0;
+    switch (orientation) {
+        case ORIENTATION_0:   dx = char_width; dy = 0; break;
+        case ORIENTATION_90:  dx = 0; dy = char_width; break;
+        case ORIENTATION_180: dx = -char_width; dy = 0; break;
+        case ORIENTATION_270: dx = 0; dy = -char_width; break;
+    }
+
+    while (*text) {
+        uint8_t c;
+        bool is_utf8 = false;
+
+        if ((unsigned char)*text == 0xC2 && (unsigned char)*(text + 1) == 0xB0) {
+            c = 127;
+            is_utf8 = true;
+        } else if ((unsigned char)*text == 0xC3 && (unsigned char)*(text + 1) == 0xA9) {
+            c = 128;
+            is_utf8 = true;
+        } else if ((unsigned char)*text == 0xC3 && (unsigned char)*(text + 1) == 0xA8) {
+            c = 129;
+            is_utf8 = true;
+        } else if (*text == '\n' || *text == '\r') {
+            text++;
+            continue;
+        } else {
+            c = *text;
+        }
+
+        if (c >= FONT8X16_FIRST_CHAR && c <= FONT8X16_LAST_CHAR) {
+            const uint8_t *char_data = font8x16[c - FONT8X16_FIRST_CHAR];
+
+            for (uint8_t row = 0; row < FONT8X16_HEIGHT; row++) {
+                uint8_t actual_row = (orientation == ORIENTATION_180) ? (FONT8X16_HEIGHT - 1 - row) : row;
+                uint8_t line = char_data[actual_row];
+
+                for (uint8_t col = 0; col < FONT8X16_WIDTH; col++) {
+                    uint8_t actual_col = (orientation == ORIENTATION_180) ? (FONT8X16_WIDTH - 1 - col) : col;
+                    if (line & (1 << actual_col)) {
+                        for (uint8_t sy = 0; sy < scale; sy++) {
+                            for (uint8_t sx = 0; sx < scale; sx++) {
+                                uint16_t px = cursor_x + col * scale + sx;
+                                uint16_t py = cursor_y + row * scale + sy;
+                                uint16_t out_x, out_y;
+                                transform_coordinates(px, py, orientation, &out_x, &out_y);
+                                epaper_draw_pixel_direct(out_x, out_y, color);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        cursor_x += dx;
+        cursor_y += dy;
+        text += is_utf8 ? 2 : 1;
+    }
+}
+

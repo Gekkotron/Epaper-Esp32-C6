@@ -10,6 +10,8 @@
 #include "ws2812.h"
 #include "driver/ledc.h"
 #include "wifi/wifi.h"
+#include "webserver/webserver.h"
+#include "config/config.h"
 
 static const char *TAG = "main";
 
@@ -61,64 +63,78 @@ if (wifi_mgr_is_connected()) {
 
     // Set tri-color mode (0 = tri-color, 1 = B/W only)
     epaper_set_bw_mode(0);
-    
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    ESP_LOGI(TAG, "E-Paper display initialized successfully");
-    
-    // Clear the display (set all pixels to white)
-    epaper_clearDisplay();
-    ESP_LOGI(TAG, "Display cleared");
 
-    /*
-    vTaskDelay(pdMS_TO_TICKS(20000));
-    ESP_LOGI(TAG, "Draw Red");
-    epaper_fill(COLOR_RED); // Start with red background
-    vTaskDelay(pdMS_TO_TICKS(20000));
-    ESP_LOGI(TAG, "Draw Black");
-    epaper_fill(COLOR_BLACK); // Start with black background
-    vTaskDelay(pdMS_TO_TICKS(20000));
-    epaper_rect(10, 10, 100, 50, COLOR_WHITE); 
-    epaper_rect(10, 50, 100, 50, COLOR_RED); 
-    ESP_LOGI(TAG, "Drew rectangles");*/
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "  E-PAPER DISPLAY READY!");
+    ESP_LOGI(TAG, "========================================");
 
-    vTaskDelay(pdMS_TO_TICKS(20000));
-    epaper_rect(0, 0, 16, 16, COLOR_RED);
-    ESP_LOGI(TAG, "Drew rect");
+    // Load configuration from .env file
+    ESP_LOGI(TAG, "Loading configuration...");
+    config_init();
 
-    // epaper_line(0, 0, 200, 200, COLOR_RED); 
-    //ESP_LOGI(TAG, "Drew line");
-    /*
-    vTaskDelay(pdMS_TO_TICKS(20000));
-    ESP_LOGI(TAG, "Draw Black");
-    epaper_fill(COLOR_BLACK); // Start with black background
-    vTaskDelay(pdMS_TO_TICKS(20000));
-    ESP_LOGI(TAG, "Draw Red");
-    epaper_fill(COLOR_RED); // Start with red background
-*/
-    /*
-    // Draw a black border
-    epaper_draw_rect(0, 0, config.width - 1, config.height - 1, COLOR_BLACK);
-    
-    // Draw black lines
-    epaper_draw_line(10, 10, 100, 50, COLOR_BLACK);
-    epaper_draw_line(10, 50, 100, 10, COLOR_BLACK);
-    
-    // Draw a red filled rectangle
-    epaper_fill_rect(120, 10, 50, 30, COLOR_RED);
-    
-    // Draw a black filled rectangle
-    epaper_fill_rect(120, 50, 50, 30, COLOR_BLACK);
-    
-    // Draw red lines
-    epaper_draw_line(10, 70, 100, 110, COLOR_RED);
-    
-    // Update display with the buffer content
-    epaper_update();
-    ESP_LOGI(TAG, "Display updated");
-    
-    ESP_LOGI(TAG, "Example completed. Display will remain showing the pattern.");
-    */
-    // Enter deep sleep or continue with other tasks
+    // Initialize WiFi
+    ESP_LOGI(TAG, "Initializing WiFi...");
+    wifi_mgr_init();
+
+    const char *ssid = config_get_wifi_ssid();
+    const char *password = config_get_wifi_password();
+
+    // Fallback to hardcoded credentials if .env is not available
+    if (strlen(ssid) == 0 || strlen(password) == 0) {
+        ESP_LOGE(TAG, "No WiFi credentials found in .env file!");
+        ESP_LOGW(TAG, "Please create data/.env with WIFI_SSID and WIFI_PASSWORD");
+        ESP_LOGW(TAG, "Then run 'pio run --target uploadfs' to upload credentials");
+
+        // Show error on screen
+        epaper_display_clear();
+        epaper_draw_text(10, 10, "Config Error", COLOR_RED, 2);
+        epaper_draw_text(10, 35, "Missing .env", COLOR_BLACK, 1);
+        epaper_draw_text(10, 50, "file", COLOR_BLACK, 1);
+        epaper_display_update();
+
+        // Keep running but skip WiFi
+        while (1) {
+            vTaskDelay(pdMS_TO_TICKS(10000));
+        }
+    }
+
+    ESP_LOGI(TAG, "Connecting to WiFi: %s", ssid);
+    wifi_mgr_connect(ssid, password);
+    wifi_mgr_wait_for_connection(10000);
+
+    if (wifi_mgr_is_connected()) {
+        char ip[16];
+        wifi_mgr_get_ip_address(ip);
+        ESP_LOGI(TAG, "✓ WiFi connected!");
+        ESP_LOGI(TAG, "✓ IP address: %s", ip);
+
+        // Display welcome message on screen
+        epaper_display_clear();
+        epaper_draw_text(10, 10, "E-Paper API", COLOR_BLACK, 2);
+        epaper_draw_text(10, 35, "Ready!", COLOR_RED, 2);
+        epaper_draw_text(10, 60, "IP:", COLOR_BLACK, 1);
+        epaper_draw_text(30, 60, ip, COLOR_BLACK, 1);
+        epaper_draw_text(10, 75, "Port: 80", COLOR_BLACK, 1);
+        epaper_display_update();
+
+        // Start web server
+        ESP_LOGI(TAG, "Starting web server...");
+        webserver_start();
+        ESP_LOGI(TAG, "========================================");
+        ESP_LOGI(TAG, "  WEB SERVER RUNNING");
+        ESP_LOGI(TAG, "  Open browser: http://%s", ip);
+        ESP_LOGI(TAG, "========================================");
+    } else {
+        ESP_LOGE(TAG, "✗ WiFi connection failed");
+
+        // Show error on screen
+        epaper_display_clear();
+        epaper_draw_text(10, 10, "WiFi Error", COLOR_RED, 2);
+        epaper_draw_text(10, 35, "Check SSID", COLOR_BLACK, 1);
+        epaper_display_update();
+    }
+
+    // Keep running
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
