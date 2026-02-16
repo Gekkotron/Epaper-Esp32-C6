@@ -7,3 +7,4 @@
 # Environment files with sensitive credentials
 data/.env
 .env
+.DS_Store
